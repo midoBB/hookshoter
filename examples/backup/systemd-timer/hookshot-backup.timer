@@ -1,0 +1,21 @@
+[Unit]
+Description=Daily Hookshot Backup Timer
+Documentation=https://github.com/yourusername/hookshot
+Requires=hookshot-backup.service
+
+[Timer]
+# Run daily at 2:00 AM
+OnCalendar=daily
+OnCalendar=*-*-* 02:00:00
+
+# Run 5 minutes after boot if missed
+Persistent=true
+
+# Randomize start time by up to 10 minutes to avoid system load spikes
+RandomizedDelaySec=10min
+
+# Accuracy (how close to the specified time)
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

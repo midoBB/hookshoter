@@ -1,0 +1,43 @@
+[Unit]
+Description=Hookshot Backup Service
+Documentation=https://github.com/yourusername/hookshot
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+# Environment variables for backup configuration
+Environment="HOOKSHOT_BACKUP_DIR=/var/backups/hookshot"
+Environment="HOOKSHOT_BACKUP_RETENTION=30"
+Environment="HOOKSHOT_BIN=/usr/local/bin/hookshot"
+Environment="HOOKSHOT_BACKUP_LOG=/var/log/hookshot-backup.log"
+
+# Optional: Notification webhook
+#Environment="HOOKSHOT_BACKUP_WEBHOOK=https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+
+# Optional: Email notifications
+#Environment="HOOKSHOT_BACKUP_EMAIL=admin@example.com"
+
+# Run the backup script
+ExecStart=/usr/local/bin/hookshot-backup.sh
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hookshot-backup
+
+# Restart policy (don't restart on failure for oneshot)
+Restart=no
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/hookshot /var/lib/hookshot /etc/hookshot /var/log
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true

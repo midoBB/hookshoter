@@ -1,0 +1,300 @@
+# GitLab CI/CD Pipeline - Deploy to Hookshot
+#
+# This pipeline builds, tests, and deploys via Hookshot.
+# Add this file to the root of your repository as: .gitlab-ci.yml
+
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  REGISTRY: registry.example.com
+  IMAGE_NAME: $CI_PROJECT_NAME
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# Build container image
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $REGISTRY
+  script:
+    - |
+      # Determine image tag
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        export IMAGE_TAG="$CI_COMMIT_TAG"
+      else
+        export IMAGE_TAG="$CI_COMMIT_REF_SLUG-sha-${CI_COMMIT_SHORT_SHA}"
+      fi
+
+      echo "Building image: $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+
+      # Build image
+      docker build \
+        --tag "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" \
+        --label "git.commit=$CI_COMMIT_SHA" \
+        --label "git.ref=$CI_COMMIT_REF_NAME" \
+        --label "pipeline.id=$CI_PIPELINE_ID" \
+        .
+
+      # Push image
+      docker push "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+
+      # Save image tag for later stages
+      echo "$IMAGE_TAG" > image_tag.txt
+  artifacts:
+    paths:
+      - image_tag.txt
+    expire_in: 1 hour
+
+# Run tests
+test:
+  stage: test
+  image: $REGISTRY/$IMAGE_NAME:$(cat image_tag.txt)
+  script:
+    - echo "Running tests..."
+    - npm test
+  dependencies:
+    - build
+  only:
+    - branches
+    - tags
+
+# Deploy to staging
+deploy:staging:
+  stage: deploy
+  image: curlimages/curl:latest
+  before_script:
+    - apk add --no-cache jq openssl
+  script:
+    - |
+      IMAGE_TAG=$(cat image_tag.txt)
+      IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+
+      echo "Deploying to staging: $IMAGE"
+
+      # Prepare deployment payload
+      PAYLOAD=$(jq -nc \
+        --arg deploy_id "deploy-$(date +%Y%m%d-%H%M%S)-${CI_PIPELINE_ID}" \
+        --arg service "my-app-staging" \
+        --arg image "$IMAGE" \
+        --arg ref "$CI_COMMIT_REF_NAME" \
+        --arg sha "$CI_COMMIT_SHA" \
+        --arg user "$GITLAB_USER_LOGIN" \
+        --arg pipeline_id "$CI_PIPELINE_ID" \
+        --arg job_id "$CI_JOB_ID" \
+        '{
+          deploy_id: $deploy_id,
+          service: $service,
+          image: $image,
+          metadata: {
+            git_ref: $ref,
+            git_sha: $sha,
+            triggered_by: $user,
+            pipeline_id: $pipeline_id,
+            job_id: $job_id,
+            environment: "staging"
+          }
+        }')
+
+      # Calculate HMAC signature
+      SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$HOOKSHOT_HMAC_SECRET" | awk '{print $2}')
+
+      # Send deployment request
+      HTTP_CODE=$(curl -X POST "$HOOKSHOT_URL/deploy" \
+        -H "Content-Type: application/json" \
+        -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+        -H "X-Request-ID: gitlab-${CI_PIPELINE_ID}" \
+        -w "%{http_code}" \
+        -o deploy_response.json \
+        -d "$PAYLOAD")
+
+      # Display response
+      cat deploy_response.json | jq .
+
+      if [ "$HTTP_CODE" -eq 200 ]; then
+        echo "✅ Deployment to staging successful"
+
+        DEPLOY_ID=$(cat deploy_response.json | jq -r '.deploy_id')
+        STATUS=$(cat deploy_response.json | jq -r '.status')
+
+        echo "Deploy ID: $DEPLOY_ID"
+        echo "Status: $STATUS"
+
+        # Save deployment info for follow-up jobs
+        echo "$DEPLOY_ID" > deploy_id.txt
+
+        exit 0
+      else
+        echo "❌ Deployment failed with HTTP $HTTP_CODE"
+        cat deploy_response.json
+        exit 1
+      fi
+  dependencies:
+    - build
+  environment:
+    name: staging
+    url: https://staging.example.com
+  only:
+    - develop
+    - merge_requests
+
+# Deploy to production
+deploy:production:
+  stage: deploy
+  image: curlimages/curl:latest
+  before_script:
+    - apk add --no-cache jq openssl
+  script:
+    - |
+      IMAGE_TAG=$(cat image_tag.txt)
+      IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+
+      echo "Deploying to production: $IMAGE"
+
+      # Get previous production image for rollback capability
+      PREVIOUS_IMAGE=$(curl -s "$HOOKSHOT_URL/services" | jq -r '.services[] | select(.name == "my-app") | .current_image')
+
+      if [ -z "$PREVIOUS_IMAGE" ] || [ "$PREVIOUS_IMAGE" == "null" ]; then
+        PREVIOUS_IMAGE="$REGISTRY/$IMAGE_NAME:latest"
+      fi
+
+      echo "Previous image: $PREVIOUS_IMAGE"
+
+      # Prepare deployment payload
+      PAYLOAD=$(jq -nc \
+        --arg deploy_id "deploy-$(date +%Y%m%d-%H%M%S)-${CI_PIPELINE_ID}" \
+        --arg service "my-app" \
+        --arg image "$IMAGE" \
+        --arg previous "$PREVIOUS_IMAGE" \
+        --arg ref "$CI_COMMIT_REF_NAME" \
+        --arg sha "$CI_COMMIT_SHA" \
+        --arg user "$GITLAB_USER_LOGIN" \
+        --arg pipeline_id "$CI_PIPELINE_ID" \
+        --arg job_id "$CI_JOB_ID" \
+        --arg tag "$CI_COMMIT_TAG" \
+        '{
+          deploy_id: $deploy_id,
+          service: $service,
+          image: $image,
+          previous_image: $previous,
+          metadata: {
+            git_ref: $ref,
+            git_sha: $sha,
+            git_tag: $tag,
+            triggered_by: $user,
+            pipeline_id: $pipeline_id,
+            job_id: $job_id,
+            environment: "production"
+          }
+        }')
+
+      # Calculate HMAC signature
+      SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$HOOKSHOT_HMAC_SECRET" | awk '{print $2}')
+
+      # Send deployment request
+      HTTP_CODE=$(curl -X POST "$HOOKSHOT_URL/deploy" \
+        -H "Content-Type: application/json" \
+        -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+        -H "X-Request-ID: gitlab-${CI_PIPELINE_ID}" \
+        -w "%{http_code}" \
+        -o deploy_response.json \
+        -d "$PAYLOAD")
+
+      # Display response
+      cat deploy_response.json | jq .
+
+      if [ "$HTTP_CODE" -eq 200 ]; then
+        DEPLOY_ID=$(cat deploy_response.json | jq -r '.deploy_id')
+        STATUS=$(cat deploy_response.json | jq -r '.status')
+
+        echo "Deploy ID: $DEPLOY_ID"
+        echo "Status: $STATUS"
+
+        if [ "$STATUS" == "Succeeded" ]; then
+          echo "✅ Deployment to production successful"
+          exit 0
+        elif [ "$STATUS" == "RolledBack" ]; then
+          echo "⚠️  Deployment failed but rolled back successfully"
+          exit 1
+        else
+          echo "❌ Deployment failed"
+          exit 1
+        fi
+      else
+        echo "❌ Deployment request failed with HTTP $HTTP_CODE"
+        cat deploy_response.json
+        exit 1
+      fi
+  dependencies:
+    - build
+    - test
+  environment:
+    name: production
+    url: https://example.com
+  only:
+    - main
+    - tags
+  when: manual  # Require manual trigger for production
+
+# Rollback job (manual)
+rollback:production:
+  stage: deploy
+  image: curlimages/curl:latest
+  before_script:
+    - apk add --no-cache jq openssl
+  script:
+    - |
+      echo "Rolling back production to previous version..."
+
+      # Get current and previous images
+      SERVICE_INFO=$(curl -s "$HOOKSHOT_URL/services" | jq '.services[] | select(.name == "my-app")')
+      CURRENT_IMAGE=$(echo "$SERVICE_INFO" | jq -r '.current_image')
+
+      # For rollback, we need to know what version to roll back to
+      # This should be provided as a CI/CD variable
+      if [ -z "$ROLLBACK_TO_IMAGE" ]; then
+        echo "Error: ROLLBACK_TO_IMAGE variable must be set"
+        echo "Current image: $CURRENT_IMAGE"
+        exit 1
+      fi
+
+      echo "Rolling back from: $CURRENT_IMAGE"
+      echo "Rolling back to: $ROLLBACK_TO_IMAGE"
+
+      # Prepare rollback payload
+      PAYLOAD=$(jq -nc \
+        --arg deploy_id "rollback-$(date +%Y%m%d-%H%M%S)-${CI_PIPELINE_ID}" \
+        --arg service "my-app" \
+        --arg image "$ROLLBACK_TO_IMAGE" \
+        --arg previous "$CURRENT_IMAGE" \
+        --arg user "$GITLAB_USER_LOGIN" \
+        '{
+          deploy_id: $deploy_id,
+          service: $service,
+          image: $image,
+          previous_image: $previous,
+          metadata: {
+            triggered_by: $user,
+            reason: "manual_rollback",
+            pipeline_id: "'$CI_PIPELINE_ID'",
+            rollback_from: $previous
+          }
+        }')
+
+      # Calculate HMAC signature and deploy
+      SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$HOOKSHOT_HMAC_SECRET" | awk '{print $2}')
+
+      curl -X POST "$HOOKSHOT_URL/deploy" \
+        -H "Content-Type: application/json" \
+        -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+        -d "$PAYLOAD" | jq .
+  environment:
+    name: production
+    action: rollback
+  when: manual
+  only:
+    - main

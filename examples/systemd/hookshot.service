@@ -1,0 +1,71 @@
+# Hookshot systemd service unit
+# Install to: /etc/systemd/system/hookshot.service
+#
+# Installation:
+#   sudo cp hookshot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable hookshot
+#   sudo systemctl start hookshot
+
+[Unit]
+Description=Hookshot Deployment Webhook Receiver
+Documentation=https://github.com/yourusername/hookshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hookshot
+Group=hookshot
+WorkingDirectory=/var/lib/hookshot
+
+# Main process
+ExecStart=/opt/hookshot/hookshot run
+
+# Graceful reload (if supported in future)
+ExecReload=/bin/kill -USR1 $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=512
+MemoryLimit=1G
+CPUQuota=200%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hookshot /var/log/hookshot /run/hookshot
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hookshot
+
+# Health monitoring
+WatchdogSec=30
+TimeoutStartSec=30
+TimeoutStopSec=300  # Wait for active deploys to complete
+
+[Install]
+WantedBy=multi-user.target
