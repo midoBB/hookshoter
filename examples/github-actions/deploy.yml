@@ -1,0 +1,190 @@
+# GitHub Actions Workflow - Deploy to Hookshot
+#
+# This workflow triggers a deployment via Hookshot after a successful build.
+# Add this file to: .github/workflows/deploy.yml
+
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  REGISTRY: registry.example.com
+  IMAGE_NAME: my-app
+
+jobs:
+  # Build and push container image
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Use semantic version for tags
+            type=semver,pattern=v{{version}}
+            # Use commit SHA for main branch
+            type=sha,prefix={{branch}}-,format=short
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Deploy via Hookshot
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}
+
+    steps:
+      - name: Deploy to Hookshot
+        env:
+          DEPLOY_URL: ${{ secrets.HOOKSHOT_URL }}
+          HMAC_SECRET: ${{ secrets.HOOKSHOT_HMAC_SECRET }}
+          SERVICE_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.environment == 'staging' && 'my-app-staging' || 'my-app' }}
+        run: |
+          # Prepare deployment payload
+          PAYLOAD=$(jq -nc \
+            --arg deploy_id "deploy-$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_NUMBER}" \
+            --arg service "$SERVICE_NAME" \
+            --arg image "${{ needs.build.outputs.image_tag }}" \
+            --arg previous "previous-image-if-known" \
+            --arg git_ref "${{ github.ref }}" \
+            --arg git_sha "${{ github.sha }}" \
+            --arg git_sha_short "${GITHUB_SHA:0:7}" \
+            --arg actor "${{ github.actor }}" \
+            --arg workflow "${{ github.workflow }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_number "${{ github.run_number }}" \
+            --arg repo "${{ github.repository }}" \
+            '{
+              deploy_id: $deploy_id,
+              service: $service,
+              image: $image,
+              previous_image: $previous,
+              metadata: {
+                git_ref: $git_ref,
+                git_sha: $git_sha,
+                git_sha_short: $git_sha_short,
+                triggered_by: $actor,
+                workflow: $workflow,
+                run_id: $run_id,
+                run_number: $run_number,
+                repository: $repo,
+                environment: "'${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}'"
+              }
+            }')
+
+          # Calculate HMAC signature
+          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$HMAC_SECRET" | awk '{print $2}')
+
+          # Send deployment request
+          HTTP_CODE=$(curl -X POST "$DEPLOY_URL/deploy" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$SIGNATURE" \
+            -H "X-Request-ID: gh-${GITHUB_RUN_ID}" \
+            -w "%{http_code}" \
+            -o /tmp/deploy_response.json \
+            -d "$PAYLOAD")
+
+          # Check response
+          cat /tmp/deploy_response.json | jq .
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Deployment successful"
+
+            # Extract deployment info
+            DEPLOY_ID=$(cat /tmp/deploy_response.json | jq -r '.deploy_id')
+            STATUS=$(cat /tmp/deploy_response.json | jq -r '.status')
+
+            echo "Deploy ID: $DEPLOY_ID"
+            echo "Status: $STATUS"
+
+            # Set outputs for later steps
+            echo "deploy_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+            echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+            exit 0
+          else
+            echo "❌ Deployment failed with HTTP $HTTP_CODE"
+            cat /tmp/deploy_response.json | jq .
+            exit 1
+          fi
+
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ Deployed to staging: `${{ needs.build.outputs.image_tag }}`\n\nDeploy ID: `${{ steps.deploy.outputs.deploy_id }}`'
+            })
+
+      - name: Create deployment status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: '${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}',
+              auto_merge: false,
+              required_contexts: []
+            });
+
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: '${{ job.status }}' === 'success' ? 'success' : 'failure',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Deployment via Hookshot'
+            });

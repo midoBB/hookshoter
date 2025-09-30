@@ -1,0 +1,344 @@
+# Hookshot Services Configuration Examples
+# This file demonstrates various deployment patterns
+
+# Global defaults inherited by all services
+[defaults]
+working_dir = "/srv"
+command_timeout = 120
+healthcheck_timeout = 60
+rollback_enabled = true
+
+# ============================================================================
+# Example 1: Containerized Web Application (Node.js/Next.js)
+# ============================================================================
+[[service]]
+name = "web-frontend"
+description = "Next.js frontend application"
+enabled = true
+working_dir = "/srv/web-frontend"
+
+[service.env]
+NODE_ENV = "production"
+PORT = "3000"
+LOG_LEVEL = "info"
+
+[service.security]
+# Only allow semantic versioned releases from specific registry
+allowed_image_pattern = '^registry\.example\.com/web-frontend:v\d+\.\d+\.\d+$'
+allowed_env_overrides = ["LOG_LEVEL", "DEBUG"]
+
+# GitHub webhook integration
+[service.github]
+repo = "myorg/web-frontend"
+
+[service.deploy]
+commands = [
+    ["podman", "pull", "{{IMAGE}}"],
+    ["podman", "inspect", "{{IMAGE}}"],  # Verify image exists
+    ["systemctl", "--user", "restart", "web-frontend.service"]
+]
+
+[service.healthcheck]
+initial_delay = 10
+interval = 5
+max_attempts = 20
+success_threshold = 3
+commands = [
+    ["curl", "-fsS", "--max-time", "10", "http://127.0.0.1:3000/health"]
+]
+
+[service.rollback]
+enabled = true
+max_attempts = 2
+commands = [
+    ["podman", "pull", "{{PREVIOUS_IMAGE}}"],
+    ["systemctl", "--user", "restart", "web-frontend.service"]
+]
+
+[service.hooks]
+pre_deploy = [
+    ["echo", "Starting deployment of {{SERVICE}} version {{IMAGE}}"]
+]
+post_deploy = [
+    ["echo", "Successfully deployed {{SERVICE}}"]
+]
+on_failure = [
+    ["echo", "Deployment failed for {{SERVICE}}"]
+]
+
+# ============================================================================
+# Example 2: REST API Service (Go)
+# ============================================================================
+[[service]]
+name = "api-backend"
+description = "Go REST API backend"
+enabled = true
+working_dir = "/srv/api-backend"
+
+[service.env]
+GO_ENV = "production"
+PORT = "8080"
+DATABASE_URL = "postgres://user:pass@localhost:5432/app"
+REDIS_URL = "redis://localhost:6379"
+
+[service.security]
+# Allow semantic versions and commit SHAs
+allowed_image_pattern = '^registry\.example\.com/api-backend:(v\d+\.\d+\.\d+|sha-[a-f0-9]{40})$'
+allowed_env_overrides = ["LOG_LEVEL", "TRACE_ENABLED"]
+
+# GitHub webhook integration
+[service.github]
+repo = "myorg/api-backend"
+
+[service.deploy]
+commands = [
+    ["podman", "pull", "{{IMAGE}}"],
+    ["podman", "run", "--rm", "--entrypoint=/bin/true", "{{IMAGE}}"],  # Smoke test
+    ["systemctl", "--user", "restart", "api-backend.service"]
+]
+
+[service.healthcheck]
+initial_delay = 15
+interval = 5
+max_attempts = 15
+success_threshold = 2
+commands = [
+    ["curl", "-fsS", "http://127.0.0.1:8080/ready"]
+]
+
+[service.rollback]
+enabled = true
+max_attempts = 3
+commands = [
+    ["podman", "pull", "{{PREVIOUS_IMAGE}}"],
+    ["systemctl", "--user", "restart", "api-backend.service"]
+]
+
+[service.hooks]
+pre_deploy = [
+    ["echo", "Pre-deploy: Backing up database"],
+    ["pg_dump", "-h", "localhost", "-U", "user", "-d", "app", "-f", "/backups/pre-deploy-{{TIMESTAMP}}.sql"]
+]
+post_deploy = [
+    ["echo", "Post-deploy: Running database migrations"],
+    ["./migrate-db.sh"]
+]
+
+# ============================================================================
+# Example 3: Static Binary Deployment (Rust/Go Binary)
+# ============================================================================
+[[service]]
+name = "metrics-collector"
+description = "Standalone metrics collection binary"
+enabled = true
+working_dir = "/opt/metrics-collector"
+
+[service.env]
+CONFIG_FILE = "/etc/metrics-collector/config.yml"
+LOG_LEVEL = "info"
+
+[service.security]
+# For binary deployments, use semantic versioning in download URL
+allowed_image_pattern = '^https://releases\.example\.com/metrics-collector/v\d+\.\d+\.\d+/binary$'
+allowed_env_overrides = ["LOG_LEVEL"]
+
+[service.deploy]
+commands = [
+    # Download binary
+    ["wget", "-O", "/tmp/metrics-collector-{{DEPLOY_ID}}", "{{IMAGE}}"],
+    ["chmod", "+x", "/tmp/metrics-collector-{{DEPLOY_ID}}"],
+    # Stop service
+    ["systemctl", "stop", "metrics-collector"],
+    # Replace binary
+    ["mv", "/tmp/metrics-collector-{{DEPLOY_ID}}", "/usr/local/bin/metrics-collector"],
+    # Start service
+    ["systemctl", "start", "metrics-collector"]
+]
+
+[service.healthcheck]
+initial_delay = 5
+interval = 3
+max_attempts = 10
+success_threshold = 2
+commands = [
+    ["systemctl", "is-active", "metrics-collector"]
+]
+
+[service.rollback]
+enabled = true
+max_attempts = 2
+commands = [
+    ["systemctl", "stop", "metrics-collector"],
+    ["wget", "-O", "/usr/local/bin/metrics-collector", "{{PREVIOUS_IMAGE}}"],
+    ["chmod", "+x", "/usr/local/bin/metrics-collector"],
+    ["systemctl", "start", "metrics-collector"]
+]
+
+# ============================================================================
+# Example 4: Python Application with Virtual Environment
+# ============================================================================
+[[service]]
+name = "ml-processor"
+description = "Python ML processing service"
+enabled = true
+working_dir = "/srv/ml-processor"
+
+[service.env]
+PYTHON_ENV = "production"
+MODEL_PATH = "/data/models"
+WORKERS = "4"
+
+[service.security]
+allowed_image_pattern = '^registry\.example\.com/ml-processor:v\d+\.\d+\.\d+$'
+allowed_env_overrides = ["WORKERS", "LOG_LEVEL"]
+
+[service.deploy]
+commands = [
+    # Pull new container image
+    ["podman", "pull", "{{IMAGE}}"],
+    # Extract code to virtual environment
+    ["bash", "-c", "podman run --rm -v /srv/ml-processor:/output {{IMAGE}} cp -r /app/* /output/"],
+    # Install dependencies
+    ["bash", "-c", "cd /srv/ml-processor && python3 -m pip install -r requirements.txt"],
+    # Restart service
+    ["systemctl", "--user", "restart", "ml-processor.service"]
+]
+
+[service.healthcheck]
+initial_delay = 20
+interval = 10
+max_attempts = 10
+success_threshold = 2
+commands = [
+    ["curl", "-fsS", "http://127.0.0.1:5000/health"]
+]
+
+[service.rollback]
+enabled = true
+commands = [
+    ["podman", "pull", "{{PREVIOUS_IMAGE}}"],
+    ["bash", "-c", "podman run --rm -v /srv/ml-processor:/output {{PREVIOUS_IMAGE}} cp -r /app/* /output/"],
+    ["bash", "-c", "cd /srv/ml-processor && python3 -m pip install -r requirements.txt"],
+    ["systemctl", "--user", "restart", "ml-processor.service"]
+]
+
+# ============================================================================
+# Example 5: Blue-Green Deployment with Symlinks
+# ============================================================================
+[[service]]
+name = "shop-service"
+description = "E-commerce shop service with blue-green deployment"
+enabled = true
+working_dir = "/srv/shop"
+
+[service.env]
+DEPLOYMENT_SLOT = "blue"  # Will be overridden by deployment
+PORT = "8000"
+
+[service.security]
+allowed_image_pattern = '^registry\.example\.com/shop:v\d+\.\d+\.\d+$'
+allowed_env_overrides = ["DEPLOYMENT_SLOT"]
+
+[service.deploy]
+commands = [
+    # Pull new image
+    ["podman", "pull", "{{IMAGE}}"],
+    # Deploy to blue slot
+    ["podman", "run", "-d", "--name", "shop-blue-{{TIMESTAMP}}", "-p", "8001:8000", "{{IMAGE}}"],
+    # Wait for startup
+    ["sleep", "10"],
+    # Update symlink to point to blue
+    ["ln", "-sfn", "/srv/shop/blue", "/srv/shop/current"],
+    # Reload nginx to point to new slot
+    ["systemctl", "reload", "nginx"],
+    # Clean up old green slot
+    ["podman", "rm", "-f", "shop-green", "||", "true"]
+]
+
+[service.healthcheck]
+initial_delay = 5
+interval = 3
+max_attempts = 10
+success_threshold = 3
+commands = [
+    ["curl", "-fsS", "http://127.0.0.1:8001/health"]
+]
+
+[service.rollback]
+enabled = true
+commands = [
+    ["ln", "-sfn", "/srv/shop/green", "/srv/shop/current"],
+    ["systemctl", "reload", "nginx"],
+    ["podman", "rm", "-f", "shop-blue"]
+]
+
+# ============================================================================
+# Example 6: Database Migration Service
+# ============================================================================
+[[service]]
+name = "db-migrations"
+description = "Database migration runner"
+enabled = false  # Typically run on-demand, not continuously
+
+[service.security]
+allowed_image_pattern = '^registry\.example\.com/migrations:.*$'
+allowed_env_overrides = []
+
+[service.deploy]
+commands = [
+    ["podman", "pull", "{{IMAGE}}"],
+    # Run migrations in a container
+    ["podman", "run", "--rm", "-e", "DATABASE_URL=postgres://...", "{{IMAGE}}", "migrate", "up"]
+]
+
+[service.healthcheck]
+# No healthcheck for one-off migrations
+commands = [
+    ["echo", "Migration completed"]
+]
+
+[service.rollback]
+enabled = true
+commands = [
+    ["podman", "pull", "{{PREVIOUS_IMAGE}}"],
+    ["podman", "run", "--rm", "-e", "DATABASE_URL=postgres://...", "{{PREVIOUS_IMAGE}}", "migrate", "down"]
+]
+
+# ============================================================================
+# Example 7: Multi-Container Deployment with Docker Compose
+# ============================================================================
+[[service]]
+name = "app-stack"
+description = "Full application stack with multiple containers"
+enabled = true
+working_dir = "/srv/app-stack"
+
+[service.security]
+allowed_image_pattern = '^v\d+\.\d+\.\d+$'  # Just version tag
+allowed_env_overrides = []
+
+[service.deploy]
+commands = [
+    # Update docker-compose.yml with new version
+    ["sed", "-i", "s/image: app:.*/image: app:{{IMAGE}}/g", "/srv/app-stack/docker-compose.yml"],
+    # Pull new images
+    ["docker-compose", "-f", "/srv/app-stack/docker-compose.yml", "pull"],
+    # Restart stack with new images
+    ["docker-compose", "-f", "/srv/app-stack/docker-compose.yml", "up", "-d", "--remove-orphans"]
+]
+
+[service.healthcheck]
+initial_delay = 20
+interval = 5
+max_attempts = 20
+success_threshold = 2
+commands = [
+    ["curl", "-fsS", "http://127.0.0.1:8080/health"]
+]
+
+[service.rollback]
+enabled = true
+commands = [
+    ["sed", "-i", "s/image: app:.*/image: app:{{PREVIOUS_IMAGE}}/g", "/srv/app-stack/docker-compose.yml"],
+    ["docker-compose", "-f", "/srv/app-stack/docker-compose.yml", "up", "-d", "--remove-orphans"]
+]

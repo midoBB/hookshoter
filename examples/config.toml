@@ -1,0 +1,122 @@
+# Hookshot System Configuration Example
+# This is a production-ready configuration with security hardening
+
+[server]
+# Network binding - use 127.0.0.1 with reverse proxy for security
+listen = "127.0.0.1:8080"
+
+# Worker thread pool size (1-2x CPU cores recommended)
+worker_threads = 8
+
+# Maximum request body size
+max_request_size = "1MB"
+
+# HTTP request timeout (seconds)
+request_timeout = 60
+
+# Graceful shutdown timeout - wait for active deployments
+shutdown_timeout = 300
+
+[security]
+# IP allowlist - empty array allows all (not recommended for production)
+# Use CIDR notation for networks
+allowed_ips = [
+    "192.168.1.0/24",      # Internal network
+    "203.0.113.50/32",     # Specific CI server
+]
+
+# Rate limit: requests per minute per IP address
+rate_limit = 100
+
+[storage]
+# Base directory for database and persistent state
+data_dir = "/var/lib/hookshot"
+
+[storage.retention]
+# Number of successful deployments to keep per service
+successful_deploys = 100
+
+# Number of failed deployments to keep per service
+failed_deploys = 50
+
+[secrets]
+# Secret loading source: "auto", "env", "file", "systemd", or ["systemd", "env"]
+source = "file"
+
+# Path to secrets file (key=value format)
+secrets_file = "/etc/hookshot/secrets"
+
+# Secrets that must be present for startup
+required_secrets = ["hmac_key"]
+
+# Reload file-based secrets every N seconds (0 = disabled)
+reload_interval = 300
+
+# Prefix for environment variable names
+secret_prefix = "HOOKSHOT_"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: json (for production) or pretty (for development)
+format = "json"
+
+# Log file directory
+directory = "/var/log/hookshot"
+
+[monitoring]
+# Enable Prometheus metrics endpoint
+metrics_enabled = true
+
+# Metrics endpoint path
+metrics_path = "/metrics"
+
+# Health check endpoint path
+health_path = "/health"
+
+# Cache health check responses for this many seconds
+status_cache_seconds = 10
+
+[limits]
+# Maximum concurrent deployments across all services
+max_concurrent_total = 10
+
+# Maximum concurrent deployments per individual service
+# (Recommended: keep at 1 to prevent race conditions)
+max_concurrent_per_service = 1
+
+# Global deployment timeout (seconds) - entire workflow
+deployment_timeout = 1800  # 30 minutes
+
+# Default timeout per command (seconds)
+command_timeout = 300  # 5 minutes
+
+# Service lock acquisition timeout (seconds)
+lock_timeout = 60
+
+[notifications]
+# Enable webhook notifications
+enabled = false
+
+# Webhook endpoints for deployment events
+[notifications.webhook]
+# Load webhook URLs from secrets manager instead of config
+# When enabled, the following secret keys will be loaded:
+#   - notifications.webhook.on_failure
+#   - notifications.webhook.on_rollback
+#   - notifications.webhook.on_success
+use_secrets = false
+
+# Option 1: Direct configuration (when use_secrets = false)
+# Notify on deployment failures
+on_failure = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+
+# Notify on automatic rollbacks
+on_rollback = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+
+# Notify on successful deployments (optional, can be noisy)
+# on_success = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+
+# Webhook request timeout (seconds)
+timeout = 5
