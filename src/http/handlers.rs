@@ -14,8 +14,6 @@ use dashmap::DashMap;
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 use tracing::{info, warn};
 
-use std::ffi::OsString;
-use std::process::Command;
 
 use crate::{
     build,
@@ -29,7 +27,6 @@ use crate::{
     state::StateManager,
     types::{DeploymentStatus, HealthStatus},
 };
-use anyhow::{anyhow, Result};
 
 /// Application state shared across handlers
 #[derive(Clone)]
@@ -175,48 +172,7 @@ pub async fn handle_health(
         // Cache expired, continue to generate fresh response
     }
 
-    // Cache miss or expired - perform actual health checks
-    async fn has_disk_space(path: &std::path::Path) -> Result<bool> {
-        // take ownership of the path so we can move it into the spawn_blocking closure
-        let path_os: OsString = path.as_os_str().to_owned();
-
-        // run `df` in a blocking thread
-        let output = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
-            // df --output=avail -B1 -- <path>
-            let out = Command::new("df")
-                .arg("--output=avail")
-                .arg("-B1")
-                .arg("--")
-                .arg(path_os)
-                .output()
-                .map_err(|e| anyhow!("failed to spawn `df`: {}", e))?;
-            Ok(out)
-        })
-        .await
-        .map_err(|e| anyhow!("spawn_blocking join error: {}", e))??;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("`df` failed: {} - {}", output.status, stderr));
-        }
-
-        // `df` output is textual; use lossy conversion to handle any odd bytes robustly
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // df prints a header line "Avail" and then one or more filesystems; take the last non-empty line
-        let last_line = stdout
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .ok_or_else(|| anyhow!("unexpected `df` output: {:?}", stdout))?;
-
-        let avail_bytes: u64 = last_line
-            .trim()
-            .parse()
-            .map_err(|e| anyhow!("failed to parse available bytes from `df`: {}", e))?;
-
-        Ok(avail_bytes > 0)
-    }
+    // Cache miss or expired - generate fresh response
     let uptime = state.start_time.elapsed().unwrap_or_default().as_secs();
 
     let response = HealthResponse {
@@ -224,31 +180,6 @@ pub async fn handle_health(
         version: build::PKG_VERSION.to_string(),
         build: build::BUILD_TIME.to_string(),
         uptime_seconds: uptime,
-        deployment_queue: QueueStatus {
-            pending: 0,
-            active: 0,
-            workers: state.system_config.server.worker_threads,
-        },
-        database: DatabaseStatus {
-            connected: state.database.get_db_connection().await.unwrap_or(false),
-            size_bytes: state.database.get_db_size().await.unwrap_or(0),
-        },
-        checks: HealthChecks {
-            database: if state.database.get_db_connection().await.unwrap_or(false) {
-                "ok".to_string()
-            } else {
-                "failed".to_string()
-            },
-            disk_space: if has_disk_space(state.system_config.storage.data_dir.as_ref())
-                .await
-                .unwrap_or(false)
-            {
-                "ok".to_string()
-            } else {
-                "failed".to_string()
-            },
-            worker_pool: "ok".to_string(),
-        },
     };
 
     // Store the fresh response in cache
@@ -928,15 +859,7 @@ on_failure = [
         assert_eq!(body["status"], "healthy");
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert!(body["uptime_seconds"].is_number());
-        assert_eq!(body["deployment_queue"]["pending"], 0);
-        assert_eq!(body["deployment_queue"]["active"], 0);
-        assert_eq!(body["deployment_queue"]["workers"], 2); // From test config
-        assert_eq!(body["database"]["connected"], true);
-        assert!(body["database"]["size_bytes"].is_number());
-        // Database structure doesn't include tables field
-        assert_eq!(body["checks"]["database"], "ok");
-        assert_eq!(body["checks"]["disk_space"], "ok");
-        assert_eq!(body["checks"]["worker_pool"], "ok");
+        assert!(body["build"].is_string());
     }
 
     #[tokio::test]

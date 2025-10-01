@@ -97,29 +97,6 @@ pub struct HealthResponse {
     pub version: String,
     pub build: String,
     pub uptime_seconds: u64,
-    pub deployment_queue: QueueStatus,
-    pub database: DatabaseStatus,
-    pub checks: HealthChecks,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct QueueStatus {
-    pub pending: u32,
-    pub active: u32,
-    pub workers: u32,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DatabaseStatus {
-    pub connected: bool,
-    pub size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthChecks {
-    pub database: String,
-    pub disk_space: String,
-    pub worker_pool: String,
 }
 
 /// Readiness response for Kubernetes-style readiness checks
