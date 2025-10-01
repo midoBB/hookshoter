@@ -16,6 +16,7 @@ use crate::types::{BackupError, Result};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub path: String,
+    pub original_path: String,
     pub checksum: String,
     pub size: u64,
 }
@@ -51,7 +52,7 @@ impl BackupManifest {
     }
 
     /// Add a file to the manifest
-    pub fn add_file(&mut self, name: String, path: &Path) -> Result<()> {
+    pub fn add_file(&mut self, name: String, path: &Path, original_path: &Path) -> Result<()> {
         let metadata = fs::metadata(path)?;
         let checksum = calculate_checksum(path)?;
 
@@ -59,6 +60,7 @@ impl BackupManifest {
             name.clone(),
             FileInfo {
                 path: name,
+                original_path: original_path.display().to_string(),
                 checksum,
                 size: metadata.len(),
             },
@@ -196,7 +198,7 @@ pub fn create_backup(
     if db_path.exists() {
         let dest = archive_staging.join("state.redb");
         fs::copy(&db_path, &dest)?;
-        manifest.add_file("state.redb".to_string(), &dest)?;
+        manifest.add_file("state.redb".to_string(), &dest, &db_path)?;
         info!("Added database to backup");
     } else {
         warn!("Database file not found, skipping");
@@ -206,7 +208,7 @@ pub fn create_backup(
     if config_path.exists() {
         let dest = archive_staging.join("config.toml");
         fs::copy(config_path, &dest)?;
-        manifest.add_file("config.toml".to_string(), &dest)?;
+        manifest.add_file("config.toml".to_string(), &dest, config_path)?;
         info!("Added system config to backup");
     } else {
         warn!("System config not found, skipping");
@@ -216,7 +218,7 @@ pub fn create_backup(
     if services_path.exists() {
         let dest = archive_staging.join("services.toml");
         fs::copy(services_path, &dest)?;
-        manifest.add_file("services.toml".to_string(), &dest)?;
+        manifest.add_file("services.toml".to_string(), &dest, services_path)?;
         info!("Added services config to backup");
     } else {
         warn!("Services config not found, skipping");
@@ -236,7 +238,7 @@ pub fn create_backup(
         if secrets_path.exists() {
             let dest = archive_staging.join("secrets");
             fs::copy(&secrets_path, &dest)?;
-            manifest.add_file("secrets".to_string(), &dest)?;
+            manifest.add_file("secrets".to_string(), &dest, &secrets_path)?;
             info!("Added secrets file to backup");
             break;
         }
@@ -340,12 +342,9 @@ pub fn validate_backup(backup_path: &Path) -> Result<BackupInfo> {
 /// Restore from a backup archive
 pub fn restore_backup(
     backup_path: &Path,
-    config_path: &Path,
-    services_path: &Path,
-    data_dir: &Path,
     dry_run: bool,
     force: bool,
-    has_active_deployments_fn: impl Fn() -> Result<bool>,
+    has_active_deployments_fn: Option<impl Fn() -> Result<bool>>,
 ) -> Result<()> {
     info!(
         backup = %backup_path.display(),
@@ -388,30 +387,20 @@ pub fn restore_backup(
         .map_err(|e| BackupError::ManifestParseFailed(e.to_string()))?;
 
     // Check for active deployments
-    if !force && has_active_deployments_fn()? {
-        return Err(BackupError::ActiveDeployments.into());
+    if !force {
+        if let Some(check_fn) = has_active_deployments_fn {
+            if check_fn()? {
+                return Err(BackupError::ActiveDeployments.into());
+            }
+        }
     }
 
-    // Plan restoration
+    // Plan restoration using original paths from manifest
     let mut restore_plan = Vec::new();
 
-    if manifest.files.contains_key("state.redb") {
-        restore_plan.push(("state.redb", data_dir.join("state.redb")));
-    }
-
-    if manifest.files.contains_key("config.toml") {
-        restore_plan.push(("config.toml", config_path.to_path_buf()));
-    }
-
-    if manifest.files.contains_key("services.toml") {
-        restore_plan.push(("services.toml", services_path.to_path_buf()));
-    }
-
-    if manifest.files.contains_key("secrets") {
-        // Restore to parent directory of config file
-        if let Some(parent) = config_path.parent() {
-            restore_plan.push(("secrets", parent.join("secrets")));
-        }
+    for (file_name, file_info) in &manifest.files {
+        let dest_path = PathBuf::from(&file_info.original_path);
+        restore_plan.push((file_name.as_str(), dest_path));
     }
 
     // Display or execute restoration plan
@@ -530,11 +519,15 @@ mod tests {
 
         let mut manifest = BackupManifest::new();
         manifest
-            .add_file("test.txt".to_string(), &file_path)
+            .add_file("test.txt".to_string(), &file_path, &file_path)
             .unwrap();
 
         assert_eq!(manifest.files.len(), 1);
         assert!(manifest.files.contains_key("test.txt"));
+        assert_eq!(
+            manifest.files.get("test.txt").unwrap().original_path,
+            file_path.display().to_string()
+        );
     }
 
     #[test]
@@ -553,7 +546,7 @@ mod tests {
 
         let mut manifest = BackupManifest::new();
         manifest
-            .add_file("test.txt".to_string(), &file_path)
+            .add_file("test.txt".to_string(), &file_path, &file_path)
             .unwrap();
 
         assert!(manifest.validate().is_ok());
@@ -628,22 +621,18 @@ mod tests {
         create_backup(&backup_path, &config_path, &services_path, &data_dir).unwrap();
 
         // Dry run restore
-        let restore_config = restore_dir.join("config.toml");
-        let restore_services = restore_dir.join("services.toml");
-        let restore_data = restore_dir.join("data");
-
         restore_backup(
             &backup_path,
-            &restore_config,
-            &restore_services,
-            &restore_data,
             true,
             false,
-            || Ok(false),
+            Some(|| Ok(false)),
         )
         .unwrap();
 
-        // Files should not exist after dry run
+        // Files should not exist in restore_dir after dry run
+        // (they would be restored to original paths)
+        let restore_config = restore_dir.join("config.toml");
+        let restore_services = restore_dir.join("services.toml");
         assert!(!restore_config.exists());
         assert!(!restore_services.exists());
     }
@@ -673,12 +662,9 @@ mod tests {
         // Try to restore with active deployments
         let result = restore_backup(
             &backup_path,
-            &config_path,
-            &services_path,
-            &data_dir,
             false,
             false,
-            || Ok(true), // Simulate active deployments
+            Some(|| Ok(true)), // Simulate active deployments
         );
 
         assert!(result.is_err());

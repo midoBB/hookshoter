@@ -358,37 +358,36 @@ pub async fn import_state(cli: Cli, args: ImportArgs) -> Result<()> {
     info!("Starting state import");
 
     let config_path = &cli.config;
-    let services_path = &cli.services;
-
-    // Load system config to get data directory
-    let system_config = SystemConfig::load_from_file(config_path)?;
-    let data_dir = PathBuf::from(&system_config.storage.data_dir);
 
     info!(
         input = %args.input_file.display(),
-        config = %config_path.display(),
-        services = %services_path.display(),
-        data_dir = %data_dir.display(),
         dry_run = args.dry_run,
         force = args.force,
         "Importing state"
     );
 
-    // Initialize state manager to check for active deployments
-    let state_manager = crate::state::StateManager::new(&data_dir)?;
+    // Try to check for active deployments, but only if config exists
+    let has_active_deployments_fn = if config_path.exists() {
+        // Load system config to get data directory
+        let system_config = SystemConfig::load_from_file(config_path)?;
+        let data_dir = PathBuf::from(&system_config.storage.data_dir);
 
-    // Create closure for checking active deployments
-    let has_active_deployments = || state_manager.has_active_deployments();
+        // Initialize state manager to check for active deployments
+        let state_manager = crate::state::StateManager::new(&data_dir)?;
+
+        // Create closure for checking active deployments
+        Some(move || state_manager.has_active_deployments())
+    } else {
+        info!("Config file not found, skipping active deployment check");
+        None
+    };
 
     // Restore the backup
     crate::backup::restore_backup(
         &args.input_file,
-        config_path,
-        services_path,
-        &data_dir,
         args.dry_run,
         args.force,
-        has_active_deployments,
+        has_active_deployments_fn,
     )?;
 
     if args.dry_run {
