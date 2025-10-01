@@ -34,7 +34,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
+            target/x86_64-unknown-linux-musl/release/build/
+            target/x86_64-unknown-linux-musl/release/deps/
+            target/x86_64-unknown-linux-musl/release/.fingerprint/
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-

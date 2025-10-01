@@ -32,7 +32,7 @@ RESET := \033[0m
 .DEFAULT_GOAL := help
 
 # Only truly action-based targets should be PHONY
-.PHONY: help all test clean fmt lint check dev
+.PHONY: help all test clean fmt lint check dev release
 
 help: ## Show this help message
 	@echo "Hookshot Makefile"
@@ -55,7 +55,8 @@ $(RELEASE_BINARY): $(RUST_SOURCES) ## Build optimized release version with musl 
 # Convenience aliases
 build: $(DEBUG_BINARY) ## Build debug version (alias)
 
-release: $(RELEASE_BINARY) ## Build optimized release version (alias)
+release:
+	cargo build --release --target $(RELEASE_TARGET)
 
 # Testing with cargo nextest
 test: ## Run all tests using cargo nextest
