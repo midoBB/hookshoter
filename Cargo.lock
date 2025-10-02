@@ -826,7 +826,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hookshot"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -845,6 +845,7 @@ dependencies = [
  "ipnet",
  "lazy_static",
  "libc",
+ "nix",
  "parking_lot",
  "prometheus",
  "rand 0.8.5",
@@ -1338,6 +1339,18 @@ dependencies = [
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.9.4",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]

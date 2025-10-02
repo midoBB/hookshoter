@@ -15,7 +15,6 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use parking_lot::Mutex;
-use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -136,9 +135,61 @@ impl Drop for SecureString {
 
 impl ZeroizeOnDrop for SecureString {}
 
+/// Protected cipher wrapper with memory security
+struct ProtectedCipher {
+    key: Vec<u8>,
+    #[allow(dead_code)]
+    guard: Option<region::LockGuard>,
+}
+
+impl ProtectedCipher {
+    /// Create a new protected cipher with memory locking
+    fn new() -> Result<Self, StorageError> {
+        let key_bytes = ChaCha20Poly1305::generate_key(&mut OsRng);
+        let key = key_bytes.to_vec();
+        let guard = MemoryProtection::lock_memory(&key).ok();
+
+        Ok(Self { key, guard })
+    }
+
+    /// Encrypt data using the protected key
+    fn encrypt(&self, nonce: &Nonce, plaintext: &[u8]) -> Result<Vec<u8>, StorageError> {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|_| StorageError::EncryptionError)?;
+
+        cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|_| StorageError::EncryptionError)
+    }
+
+    /// Decrypt data using the protected key
+    fn decrypt(&self, nonce: &Nonce, ciphertext: &[u8]) -> Result<Vec<u8>, StorageError> {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|_| StorageError::EncryptionError)?;
+
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| StorageError::EncryptionError)
+    }
+}
+
+impl std::fmt::Debug for ProtectedCipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ProtectedCipher([REDACTED {} bytes])", self.key.len())
+    }
+}
+
+impl Drop for ProtectedCipher {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ProtectedCipher {}
+
 /// Simple secure secret store
 pub struct SecretStore {
-    cipher: ChaCha20Poly1305,
+    cipher: ProtectedCipher,
     secrets: Arc<Mutex<HashMap<String, EncryptedSecret>>>,
 }
 
@@ -148,8 +199,7 @@ impl SecretStore {
         // Disable core dumps for security
         MemoryProtection::disable_core_dumps()?;
 
-        let master_key_bytes = ChaCha20Poly1305::generate_key(&mut OsRng);
-        let cipher = ChaCha20Poly1305::new(&master_key_bytes);
+        let cipher = ProtectedCipher::new()?;
 
         Ok(Self {
             cipher,
@@ -160,10 +210,7 @@ impl SecretStore {
     /// Store a secret securely
     pub fn store_secret(&self, key: &str, secret: &str) -> Result<(), StorageError> {
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = self
-            .cipher
-            .encrypt(&nonce, secret.as_bytes())
-            .map_err(|_| StorageError::EncryptionError)?;
+        let ciphertext = self.cipher.encrypt(&nonce, secret.as_bytes())?;
 
         let encrypted_secret = EncryptedSecret {
             ciphertext,
@@ -188,8 +235,7 @@ impl SecretStore {
         let nonce = Nonce::from_slice(&encrypted_secret.nonce);
         let plaintext = self
             .cipher
-            .decrypt(nonce, encrypted_secret.ciphertext.as_ref())
-            .map_err(|_| StorageError::EncryptionError)?;
+            .decrypt(nonce, encrypted_secret.ciphertext.as_ref())?;
 
         let secret_string =
             String::from_utf8(plaintext).map_err(|_| StorageError::EncryptionError)?;
@@ -217,18 +263,6 @@ impl SecureUtils {
         result == 0
     }
 
-    /// Generate a cryptographically secure random token
-    pub fn generate_secure_token(length: usize) -> String {
-        const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
-        let mut rng = rand::thread_rng();
-        (0..length)
-            .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
-                CHARSET[idx] as char
-            })
-            .collect()
-    }
 
     /// Validate HMAC signature using constant-time comparison
     pub fn validate_hmac_signature(expected: &[u8], provided: &[u8]) -> bool {
@@ -289,17 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn test_secure_token_generation() {
-        let token1 = SecureUtils::generate_secure_token(32);
-        let token2 = SecureUtils::generate_secure_token(32);
-
-        assert_eq!(token1.len(), 32);
-        assert_eq!(token2.len(), 32);
-        assert_ne!(token1, token2); // Should be different
-        assert!(token1.chars().all(|c| c.is_ascii_alphanumeric()));
-    }
-
-    #[test]
     fn test_hmac_validation() {
         let key = b"test_key";
         let data = b"test_data";
@@ -307,5 +330,96 @@ mod tests {
         // This is a simplified test - in real usage you'd use proper HMAC
         assert!(SecureUtils::validate_hmac_signature(key, key));
         assert!(!SecureUtils::validate_hmac_signature(key, data));
+    }
+
+    #[test]
+    fn test_protected_cipher_encryption_decryption() {
+        let cipher = ProtectedCipher::new().unwrap();
+        let plaintext = b"sensitive data";
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        // Encrypt
+        let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap();
+        assert_ne!(ciphertext.as_slice(), plaintext);
+
+        // Decrypt
+        let decrypted = cipher.decrypt(&nonce, &ciphertext).unwrap();
+        assert_eq!(decrypted.as_slice(), plaintext);
+    }
+
+    #[test]
+    fn test_protected_cipher_debug_redaction() {
+        let cipher = ProtectedCipher::new().unwrap();
+        let debug_str = format!("{:?}", cipher);
+        assert!(debug_str.contains("[REDACTED"));
+        assert!(debug_str.contains("32 bytes")); // ChaCha20Poly1305 key is 32 bytes
+    }
+
+    #[test]
+    fn test_protected_cipher_zeroization() {
+        use std::ptr;
+
+        let cipher = ProtectedCipher::new().unwrap();
+        let key_ptr = cipher.key.as_ptr();
+        let key_len = cipher.key.len();
+
+        // Create a copy to check later (this is just for testing)
+        let mut key_copy = vec![0u8; key_len];
+        unsafe {
+            ptr::copy_nonoverlapping(key_ptr, key_copy.as_mut_ptr(), key_len);
+        }
+
+        // Verify the key is not all zeros initially
+        assert!(!key_copy.iter().all(|&b| b == 0));
+
+        // Drop the cipher
+        drop(cipher);
+
+        // Note: We can't directly verify memory was zeroed because it's deallocated
+        // This test mainly ensures the Drop implementation compiles and runs
+        // In a real scenario, you'd use tools like valgrind or memory inspection
+    }
+
+    #[test]
+    fn test_secret_store_with_protected_cipher() {
+        let store = SecretStore::new().unwrap();
+
+        // Store multiple secrets
+        store.store_secret("key1", "value1").unwrap();
+        store.store_secret("key2", "value2").unwrap();
+
+        // Retrieve and verify
+        let secret1 = store.get_secret("key1").unwrap();
+        let secret2 = store.get_secret("key2").unwrap();
+
+        assert_eq!(secret1.expose(), "value1");
+        assert_eq!(secret2.expose(), "value2");
+    }
+
+    #[test]
+    fn test_cipher_memory_lock_attempt() {
+        // This test verifies that memory locking is attempted
+        // Even if it fails (e.g., insufficient permissions), the code should handle it gracefully
+        let cipher = ProtectedCipher::new().unwrap();
+
+        // The guard field exists, which means memory locking was attempted
+        // We can't guarantee it succeeded (depends on OS permissions),
+        // but we can verify the code doesn't panic
+        assert_eq!(cipher.key.len(), 32); // ChaCha20Poly1305 key size
+    }
+
+    #[test]
+    fn test_cipher_different_keys_produce_different_ciphertexts() {
+        let cipher1 = ProtectedCipher::new().unwrap();
+        let cipher2 = ProtectedCipher::new().unwrap();
+
+        let plaintext = b"same plaintext";
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        let ciphertext1 = cipher1.encrypt(&nonce, plaintext).unwrap();
+        let ciphertext2 = cipher2.encrypt(&nonce, plaintext).unwrap();
+
+        // Different keys should produce different ciphertexts
+        assert_ne!(ciphertext1, ciphertext2);
     }
 }

@@ -2,9 +2,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
+
+#[cfg(unix)]
+use nix::sys::signal::{self, Signal};
+#[cfg(unix)]
+use nix::unistd::Pid;
 
 use super::templates::ExecutionContext;
 use crate::types::{CommandPhase, CommandResult, ExecutionError, Result};
@@ -108,19 +114,57 @@ impl CommandExecutor {
             .stderr(Stdio::piped())
             .stdin(Stdio::null()); // Ensure no stdin interaction
 
-        // Execute with timeout
-        let execution_result = timeout(self.timeout, cmd.output()).await;
+        // Spawn the child process to get a handle for graceful termination
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(io_error) => {
+                error!(
+                    command = ?command,
+                    error = %io_error,
+                    "Failed to spawn command"
+                );
+                return Err(ExecutionError::StartFailed {
+                    command: command.join(" "),
+                    source: io_error,
+                }
+                .into());
+            }
+        };
+
+        // Get stdout and stderr handles
+        let mut stdout_handle = child.stdout.take().expect("stdout was not piped");
+        let mut stderr_handle = child.stderr.take().expect("stderr was not piped");
+
+        // Execute with timeout and graceful termination
+        let execution_result = timeout(self.timeout, async {
+            // Read output concurrently while waiting for process
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+
+            let read_stdout = stdout_handle.read_to_end(&mut stdout_buf);
+            let read_stderr = stderr_handle.read_to_end(&mut stderr_buf);
+            let wait_child = child.wait();
+
+            // Wait for all three operations to complete
+            let (_, _, status) = tokio::join!(read_stdout, read_stderr, wait_child);
+
+            match status {
+                Ok(status) => Ok((status, stdout_buf, stderr_buf)),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
 
         let duration = start_time.elapsed();
         let duration_ms = duration.as_millis() as u64;
 
         match execution_result {
-            Ok(Ok(output)) => {
-                let exit_code = output.status.code();
+            Ok(Ok((status, stdout_buf, stderr_buf))) => {
+                let exit_code = status.code();
 
                 // Truncate output to prevent memory issues
-                let stdout = truncate_output(output.stdout);
-                let stderr = truncate_output(output.stderr);
+                let stdout = truncate_output(stdout_buf);
+                let stderr = truncate_output(stderr_buf);
 
                 debug!(
                     command = ?command,
@@ -178,8 +222,11 @@ impl CommandExecutor {
                     command = ?command,
                     timeout_secs = self.timeout.as_secs(),
                     duration_ms = duration_ms,
-                    "Command timed out"
+                    "Command timed out, attempting graceful termination"
                 );
+
+                // Attempt graceful termination with SIGTERM, then SIGKILL if needed
+                graceful_terminate_child(&mut child, command).await;
 
                 Err(ExecutionError::Timeout {
                     command: command.join(" "),
@@ -406,6 +453,84 @@ fn truncate_output(output: Vec<u8>) -> String {
     }
 }
 
+/// Gracefully terminate a child process using SIGTERM, then SIGKILL if needed
+#[cfg(unix)]
+async fn graceful_terminate_child(child: &mut tokio::process::Child, command: &[String]) {
+    // Get the PID
+    let pid = match child.id() {
+        Some(pid) => Pid::from_raw(pid as i32),
+        None => {
+            warn!(command = ?command, "Child process has no PID, already terminated");
+            return;
+        }
+    };
+
+    // First, try SIGTERM for graceful shutdown
+    info!(
+        command = ?command,
+        pid = pid.as_raw(),
+        grace_period_secs = TERMINATION_GRACE_PERIOD.as_secs(),
+        "Sending SIGTERM to child process"
+    );
+
+    if let Err(e) = signal::kill(pid, Signal::SIGTERM) {
+        warn!(
+            command = ?command,
+            pid = pid.as_raw(),
+            error = %e,
+            "Failed to send SIGTERM, process may have already terminated"
+        );
+        return;
+    }
+
+    // Wait for the grace period, checking if process terminates
+    let grace_result = timeout(TERMINATION_GRACE_PERIOD, child.wait()).await;
+
+    match grace_result {
+        Ok(Ok(_status)) => {
+            info!(
+                command = ?command,
+                pid = pid.as_raw(),
+                "Child process terminated gracefully after SIGTERM"
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(
+                command = ?command,
+                pid = pid.as_raw(),
+                error = %e,
+                "Error waiting for child process"
+            );
+        }
+        Err(_) => {
+            // Grace period expired, force kill with SIGKILL
+            warn!(
+                command = ?command,
+                pid = pid.as_raw(),
+                grace_period_secs = TERMINATION_GRACE_PERIOD.as_secs(),
+                "Child process did not terminate within grace period, sending SIGKILL"
+            );
+
+            if let Err(e) = signal::kill(pid, Signal::SIGKILL) {
+                error!(
+                    command = ?command,
+                    pid = pid.as_raw(),
+                    error = %e,
+                    "Failed to send SIGKILL to child process"
+                );
+            } else {
+                // Wait a bit for SIGKILL to take effect
+                let _ = timeout(Duration::from_secs(1), child.wait()).await;
+                info!(
+                    command = ?command,
+                    pid = pid.as_raw(),
+                    "Child process forcefully terminated with SIGKILL"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::templates::ExecutionContext;
@@ -621,5 +746,40 @@ mod tests {
         assert_eq!(step.retry_delay, 5);
         assert!(!step.critical);
         assert_eq!(step.timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_graceful_termination_on_timeout() {
+        use std::time::Duration;
+
+        let executor = CommandExecutor::new(
+            Duration::from_millis(500), // Short timeout
+            HashMap::new(),
+            "/tmp",
+        );
+
+        // This command will timeout and trigger graceful termination
+        let result = executor
+            .execute(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "trap 'exit 0' TERM; sleep 10".to_string(), // Sleep 10s, but handle SIGTERM gracefully
+                ],
+                CommandPhase::Deploy,
+                "test_graceful_term",
+            )
+            .await;
+
+        // Should timeout
+        assert!(
+            matches!(
+                result,
+                Err(crate::types::Error::Execution(ExecutionError::Timeout { .. }))
+            ),
+            "Expected timeout error, got: {:?}",
+            result
+        );
     }
 }

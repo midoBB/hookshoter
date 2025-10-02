@@ -1,6 +1,6 @@
 [package]
 name = "hookshot"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 authors = ["Mohamed Hamdi <haamdi@outlook.com>"]
 description = "Lightweight deployment webhook receiver"
@@ -64,6 +64,8 @@ libc = "0.2"
 ring = "0.17"
 constant_time_eq = "0.3"
 hex = "0.4"
+
+nix = { version = "0.29", features = ["signal", "process"] }
 
 # IP filtering and rate limiting
 ipnet = "2.9"
